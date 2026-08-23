@@ -181,8 +181,12 @@ async def _telegram_send(text: str) -> Optional[int]:
     """Send a new Telegram message. Returns message_id on success."""
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    
+    # <--- MODIFICATION: Logs plus détaillés et meilleure gestion d'erreur
     if not token or not chat_id:
+        logging.error("Telegram: token ou chat_id manquant")
         return None
+    
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -194,12 +198,33 @@ async def _telegram_send(text: str) -> Optional[int]:
         async with httpx.AsyncClient(timeout=10.0) as http:
             r = await http.post(url, json=payload)
         j = r.json()
+        
+        # Log détaillé
+        logging.info(f"Telegram send - status: {r.status_code}, ok: {j.get('ok')}")
+        
         if r.status_code == 200 and j.get("ok"):
             return j["result"]["message_id"]
-        logging.warning(f"telegram send failed: {r.status_code} {r.text[:200]}")
-    except Exception:
-        logging.exception("Telegram send failed")
+        
+        # Gestion spécifique des erreurs
+        if r.status_code == 403:
+            error_desc = j.get("description", "")
+            if "chat was deleted" in error_desc:
+                logging.error("❌ Le chat a été supprimé ! Vérifie TELEGRAM_CHAT_ID")
+            elif "bot was blocked" in error_desc:
+                logging.error("❌ Le bot a été bloqué par l'utilisateur")
+            elif "bot is not a member" in error_desc:
+                logging.error("❌ Le bot n'est pas membre du chat")
+            else:
+                logging.error(f"❌ Erreur 403: {error_desc}")
+        elif r.status_code == 404:
+            logging.error("❌ Token invalide (404)")
+        else:
+            logging.warning(f"telegram send failed: {r.status_code} {r.text[:200]}")
+            
+    except Exception as e:
+        logging.exception(f"Telegram send exception: {str(e)}")
     return None
+    # <--- FIN MODIFICATION
 
 
 async def _telegram_edit(message_id: int, text: str) -> tuple[bool, float]:
@@ -363,6 +388,79 @@ async def health():
         "mongo_error": mongo_error,
         "time": _now_iso(),
     }
+
+
+# <--- MODIFICATION: Nouvelle route de test Telegram
+@api_router.get("/telegram-test")
+async def test_telegram():
+    """Test complet de la configuration Telegram"""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    
+    results = {
+        "token": token[:10] + "..." if token else "MISSING",
+        "chat_id": chat_id if chat_id else "MISSING",
+        "token_valid": False,
+        "bot_info": None,
+        "can_send": False,
+        "available_chats": [],
+        "error": None
+    }
+    
+    # Test 1 : Vérifier le token
+    if token:
+        try:
+            url = f"https://api.telegram.org/bot{token}/getMe"
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                r = await http.get(url)
+                if r.status_code == 200:
+                    data = r.json()
+                    results["token_valid"] = data.get("ok", False)
+                    results["bot_info"] = data.get("result")
+                else:
+                    results["error"] = f"Token invalide: {r.status_code}"
+        except Exception as e:
+            results["error"] = f"Erreur token: {str(e)}"
+    
+    # Test 2 : Récupérer les chats disponibles
+    if token and results["token_valid"]:
+        try:
+            url = f"https://api.telegram.org/bot{token}/getUpdates"
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                r = await http.get(url)
+                if r.status_code == 200:
+                    data = r.json()
+                    for update in data.get("result", []):
+                        if "message" in update and "chat" in update["message"]:
+                            chat = update["message"]["chat"]
+                            results["available_chats"].append({
+                                "id": chat["id"],
+                                "type": chat["type"],
+                                "title": chat.get("title", "Private"),
+                                "username": chat.get("username", "")
+                            })
+        except Exception as e:
+            results["error"] = f"Erreur getUpdates: {str(e)}"
+    
+    # Test 3 : Essayer d'envoyer un message (si token valide et chat_id présent)
+    if token and chat_id and results["token_valid"]:
+        try:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": "🧪 Test de connexion depuis Railway",
+                "parse_mode": "HTML"
+            }
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                r = await http.post(url, json=payload)
+                results["can_send"] = r.status_code == 200
+                if not results["can_send"]:
+                    results["error"] = f"Envoi échoué: {r.status_code} - {r.text[:100]}"
+        except Exception as e:
+            results["error"] = f"Erreur envoi: {str(e)}"
+    
+    return results
+# <--- FIN MODIFICATION
 
 
 @api_router.post("/sessions", response_model=SessionOut)
